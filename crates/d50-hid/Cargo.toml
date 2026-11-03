@@ -1,0 +1,32 @@
+[package]
+name = "d50-hid"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "d50-probe"
+path = "src/bin/d50_probe.rs"
+required-features = ["hid"]
+
+[[example]]
+name = "button_layout"
+path = "examples/button_layout.rs"
+required-features = ["hid"]
+
+[[example]]
+name = "button_order"
+path = "examples/button_order.rs"
+required-features = ["hid"]
+
+[dependencies]
+d50-protocol = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+hidapi = { workspace = true, optional = true }
+clap = { workspace = true }
+
+[features]
+default = []
+hid = ["dep:hidapi"]

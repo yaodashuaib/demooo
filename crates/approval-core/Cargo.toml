@@ -1,0 +1,11 @@
+[package]
+name = "approval-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+d50-protocol = { workspace = true }
+serde = { workspace = true }
+uuid = { workspace = true }
