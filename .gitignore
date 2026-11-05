@@ -4,6 +4,11 @@ target/
 # Runtime logs (keep folder via .gitkeep)
 logs/*.log
 logs/*.txt
+apps/agent-bridge-service/logs/
+
+# Qt Creator / CMake build artifacts
+apps/d50-config-client/.qtcreator/CMakeLists.txt.user
+apps/d50-config-client/build/
 
 # IDE / editor
 .vscode/
