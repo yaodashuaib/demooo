@@ -119,6 +119,10 @@ async fn main() {
         "agent-bridge-service: pipe={} simulate={}",
         bridge.pipe, args.simulate
     );
+    eprintln!(
+        "agent-bridge-service: usage log={}",
+        config_core::log_path_hint()
+    );
 
     tokio::signal::ctrl_c().await.ok();
     bridge.shutdown().await;

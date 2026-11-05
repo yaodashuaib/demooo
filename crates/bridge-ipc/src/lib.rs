@@ -69,6 +69,36 @@ pub enum Request {
         request_id: String,
         button_index: u8,
     },
+    /// 配置投影状态：在线、Agent 槽、余额摘要、声光草稿（只读缓存，不 kick HID）。
+    ConfigStatus,
+    /// 绑定 allowlist Agent：分配并持久化 `agentIndex`，在线时下发 INDEX + 合并余额。
+    ConfigBindAgent {
+        id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        name: Option<String>,
+    },
+    /// 解绑 Agent：释放槽位（不重排），在线时全量 INDEX + 缓存组 BALANCE。
+    ConfigUnbindAgent {
+        id: String,
+    },
+    /// 设置余额刷新间隔（秒）；钳制 30–3600，写入 d50-bridge.json 并重置 timer。
+    ConfigSetBalanceInterval {
+        secs: u64,
+    },
+    /// 下发或预览声光；`preview` 为 true 时不写本机草稿文件。
+    ConfigSetSoundLight {
+        /// 与协议 `SET_SOUND_LIGHT_CONFIG` 同形的 JSON 对象。
+        config: serde_json::Value,
+        #[serde(default)]
+        preview: bool,
+    },
+    /// 保存或清除 WorkBuddy 网站会话 Cookie（写入本机 AppData，不经 HID）。
+    ConfigSetWorkbuddySession {
+        /// 完整 Cookie 头；空字符串表示清除已保存会话。
+        cookie: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        chrome_major: Option<u32>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -81,6 +111,34 @@ pub struct DeviceView {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConfigAgentView {
+    pub id: String,
+    pub name: String,
+    pub agent_index: u8,
+    pub balance_ok: bool,
+    pub balance_summary: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConfigView {
+    pub device: DeviceView,
+    pub agents: Vec<ConfigAgentView>,
+    pub last_projection_at: Option<u64>,
+    pub sound_light: serde_json::Value,
+    /// 是否已配置 WorkBuddy 会话（不回传 Cookie 明文）。
+    #[serde(default)]
+    pub workbuddy_session_configured: bool,
+    /// 余额全量刷新间隔（秒）。
+    #[serde(default = "default_balance_refresh_secs")]
+    pub balance_refresh_secs: u64,
+    pub errors: Vec<String>,
+}
+
+fn default_balance_refresh_secs() -> u64 {
+    180
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "result", rename_all = "snake_case")]
 pub enum Response {
     Hello { protocol: u32, device: DeviceView },
@@ -89,6 +147,7 @@ pub enum Response {
     Device { device: DeviceView },
     /// 提示是否真的显示出来了（槽位满时会被丢掉）。
     Notice { shown: bool },
+    Config { config: ConfigView },
     Ok,
     Error { code: String, message: String },
 }
@@ -300,5 +359,28 @@ mod tests {
         let text = serde_json::to_string(&Response::error("QUEUE_FULL", "6 shown")).unwrap();
         assert!(text.contains(r#""result":"error""#));
         assert!(text.contains("QUEUE_FULL"));
+    }
+
+    #[test]
+    fn config_bind_unbind_interval_round_trip() {
+        let bind = Request::ConfigBindAgent {
+            id: "chatgpt".into(),
+            name: Some("ChatGPT".into()),
+        };
+        let text = serde_json::to_string(&bind).unwrap();
+        assert!(text.contains(r#""method":"config_bind_agent""#));
+        let decoded: Request = serde_json::from_str(&text).unwrap();
+        assert_eq!(decoded, bind);
+
+        let unbind = Request::ConfigUnbindAgent {
+            id: "kimi".into(),
+        };
+        let text = serde_json::to_string(&unbind).unwrap();
+        assert!(text.contains(r#""method":"config_unbind_agent""#));
+
+        let interval = Request::ConfigSetBalanceInterval { secs: 180 };
+        let text = serde_json::to_string(&interval).unwrap();
+        assert!(text.contains(r#""method":"config_set_balance_interval""#));
+        assert!(text.contains("180"));
     }
 }

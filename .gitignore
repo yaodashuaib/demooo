@@ -1,6 +1,10 @@
 # Rust build artifacts
 target/
 
+# Runtime logs (keep folder via .gitkeep)
+logs/*.log
+logs/*.txt
+
 # IDE / editor
 .vscode/
 .idea/

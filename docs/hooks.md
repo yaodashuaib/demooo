@@ -167,18 +167,6 @@ WorkBuddy（腾讯云 CodeBuddy 系）用户级 hooks：`~/.workbuddy/settings.j
   （`workbuddy://chat/{session_id}` 或 CLI focus），与 Claude/Codex 相同。
 - **PreToolUse**：不阻塞（立刻 `{}`），避免误挂。
 
-> **WorkBuddy 桌面实测（2026-11）**：
-> 1. `HookExecutor` 日志只写 `cmd=…d50-hook.exe`，**不传 settings 的 `args` 数组**。
->    参数必须写进 `command` 一整串，否则会落到默认 `--agent claude-code`（标题变
->    「Claude Code」、deeplink 也错）。
-> 2. `AskUserQuestion` 在 `waiting_for_permission` 用客户端原生选题 UI，**此阶段不跑**
->    用户 `PermissionRequest` hook；人选完后才 `TOOL_STARTED` → `PreToolUse`。
->    弹层一出来就亮 D50 **做不到**（WorkBuddy 不回调）；`PreToolUse` 仍会推
->    「WorkBuddy · 待回复」，多半已答完，仅用来验 open app / 品牌。
-> 3. 无害 `Bash`（如 `node -e …`）常走 **sandbox skip 8-Phase**，根本不进
->    `PermissionRequest`，D50 不会出现同意/拒绝——要测门控需关掉沙箱或换会弹权限的命令。
-> 4. 宿主识别含 `WorkBuddy.exe`：桌面客户端走 `workbuddy://`（已注册）或
->    `focus://exe/WorkBuddy.exe`，不应再落到 `focus://window/…` 的 CLI 路径。
 
 ```json
 {

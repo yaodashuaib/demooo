@@ -1,0 +1,11 @@
+agent-bridge-service: pipe=\\.\pipe\ulanzi-d50-bridge.v1 simulate=false
+agent-bridge-service: usage log=D:\workplace\demo\demooo\logs\usage.log
+device offline: skip SET_AGENT_BALANCE / icons (will push when online)
+device: SET_AGENT_BALANCE agents=4 bytes=363
+device: icon claude_code 100x100 2940 bytes (raw)
+device: icon kimi 100x100 2741 bytes (raw)
+device: icon chatgpt 100x100 5958 bytes (raw)
+device: icon workbuddy 100x100 8052 bytes (raw)
+device: SET_AGENT_INDEX count=4 force=true
+device: SET_AGENT_INDEX payload=19704 bytes (4 agents)
+device: SET_AGENT_INDEX ok (attempt 1)

@@ -29,6 +29,8 @@ enum Command {
     },
     /// 推一条不阻塞任何人的演示会话，用来确认设备能显示、能按键。
     SelfTest,
+    /// 配置投影状态（Agent 槽、余额摘要、声光草稿）。
+    ConfigStatus,
 }
 
 #[tokio::main(flavor = "current_thread")]
@@ -41,6 +43,7 @@ async fn main() {
             button_index: button,
         },
         Command::SelfTest => bridge_ipc::Request::DeviceSelfTest,
+        Command::ConfigStatus => bridge_ipc::Request::ConfigStatus,
     };
 
     match bridge_ipc::call(&cli.pipe, &request, Duration::from_secs(8)).await {
@@ -50,6 +53,25 @@ async fn main() {
             println!("firmware {}", device.firmware.unwrap_or_else(|| "-".into()));
             println!("shown    {}", device.shown);
             println!("queued   {}", device.queued);
+        }
+        Ok(bridge_ipc::Response::Config { config }) => {
+            println!("online   {}", config.device.online);
+            println!(
+                "projected {}",
+                config
+                    .last_projection_at
+                    .map(|v| v.to_string())
+                    .unwrap_or_else(|| "-".into())
+            );
+            for agent in config.agents {
+                println!(
+                    "agent[{}] {} ok={} {}",
+                    agent.agent_index, agent.id, agent.balance_ok, agent.balance_summary
+                );
+            }
+            for err in config.errors {
+                println!("error    {err}");
+            }
         }
         Ok(bridge_ipc::Response::Ok) => println!("ok"),
         Ok(bridge_ipc::Response::Error { code, message }) => {

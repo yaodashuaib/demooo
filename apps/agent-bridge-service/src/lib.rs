@@ -1,19 +1,23 @@
 //! 审批桥接服务：命名管道进、D50 HID 出。
 //!
-//! 进程内只有三块：状态（`Approval` + 等待者）、设备工作线程、管道服务器。
-//! 所有可能改变设备内容的动作都走同一个 `sync`，并用 revision 丢弃迟到的旧投影。
+//! 进程内：审批状态、配置投影、设备工作线程、管道服务器。
+//! 会话投影走 `DeviceWorker::sync`（revision 丢弃迟到帧）；图标 / 余额 / 声光走同线程队列上的其它命令，共享 Stop-and-Wait。
 
+pub mod config_proj;
 pub mod device;
 pub mod state;
 
 use approval_core::{Approval, ApprovalOption, ApprovalRequest, Outcome, SlotView, SubmitOutcome};
 use bridge_ipc::{DeviceView, Listener, Request, Response};
+use config_core::{BridgeConfig, LinkedAppsError, SoundLightConfig, bind_agent, unbind_agent};
+use config_proj::{ConfigState, ProjectionPaths, SharedConfig, default_paths, system_locale};
 use d50_hid::{Link, SessionEvent, sim};
 use device::DeviceWorker;
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
-use tokio::sync::{Mutex, mpsc, oneshot};
+use tokio::sync::{Mutex, Notify, mpsc, oneshot};
 use tokio::task::JoinHandle;
 
 pub struct Config {
@@ -40,8 +44,14 @@ struct State {
 #[derive(Clone)]
 struct Ctx {
     state: Arc<Mutex<State>>,
+    config: SharedConfig,
+    paths: Arc<ProjectionPaths>,
     device: DeviceWorker,
     sim: Option<sim::SimHandle>,
+    /// 用量采集在阻塞线程里跑；防止 bind / 定时器 / 上线叠压。
+    proj_busy: Arc<std::sync::atomic::AtomicBool>,
+    balance_refresh_secs: Arc<AtomicU64>,
+    balance_timer_reset: Arc<Notify>,
 }
 
 pub struct Bridge {
@@ -82,11 +92,41 @@ pub fn start(config: Config) -> Result<Bridge, String> {
     };
 
     let (events_tx, mut events_rx) = mpsc::unbounded_channel();
-    let device = DeviceWorker::spawn(link, events_tx);
+    let reopen = if config.simulate {
+        None
+    } else {
+        let serial = config.serial.clone();
+        let device_index = config.device_index;
+        let prefix = config.report_id_prefix;
+        Some(Box::new(move || {
+            open_hid(serial.as_deref(), device_index, prefix)
+        }) as device::ReopenFn)
+    };
+    let device = DeviceWorker::spawn(link, events_tx, reopen);
+    let paths = Arc::new(default_paths());
+    let bridge_cfg = BridgeConfig::load(&paths.bridge_config);
+    let balance_secs = BridgeConfig::clamp_secs(bridge_cfg.balance_refresh_secs);
+    let mut config_state = ConfigState::default();
+    config_state.sound_light = ConfigState::load_sound_light(&paths.sound_light);
+    config_state.balance_refresh_secs = balance_secs;
+    // 启动即装载已绑定槽，供 UPSERT_CONVERSATION 引用正确 AgentIndex。
+    let (boot_agents, boot_errors) = config_proj::read_projectable(&paths);
+    config_state.agents = boot_agents;
+    config_state.errors = boot_errors;
+    let boot_indices = bound_indices_map(&config_state.agents);
+    let mut boot_state = State::default();
+    boot_state.approval.set_bound_agent_indices(boot_indices);
+    let balance_refresh_secs = Arc::new(AtomicU64::new(balance_secs));
+    let balance_timer_reset = Arc::new(Notify::new());
     let ctx = Ctx {
-        state: Arc::new(Mutex::new(State::default())),
+        state: Arc::new(Mutex::new(boot_state)),
+        config: Arc::new(Mutex::new(config_state)),
+        paths,
         device,
         sim,
+        proj_busy: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        balance_refresh_secs,
+        balance_timer_reset,
     };
 
     let device_ctx = ctx.clone();
@@ -103,6 +143,19 @@ pub fn start(config: Config) -> Result<Bridge, String> {
         loop {
             ticker.tick().await;
             expire_tick(&timer_ctx).await;
+        }
+    });
+
+    let proj_ctx = ctx.clone();
+    let proj_task = tokio::spawn(async move {
+        loop {
+            let secs = proj_ctx.balance_refresh_secs.load(Ordering::SeqCst).max(30);
+            tokio::select! {
+                _ = tokio::time::sleep(Duration::from_secs(secs)) => {
+                    kick_balance(&proj_ctx);
+                }
+                _ = proj_ctx.balance_timer_reset.notified() => {}
+            }
         }
     });
 
@@ -130,7 +183,7 @@ pub fn start(config: Config) -> Result<Bridge, String> {
 
     Ok(Bridge {
         pipe: config.pipe,
-        tasks: vec![device_task, timer_task, accept_task],
+        tasks: vec![device_task, timer_task, proj_task, accept_task],
     })
 }
 
@@ -279,7 +332,258 @@ async fn handle(ctx: &Ctx, request: Request) -> Response {
             }
             None => Response::error("DEVICE_NOT_SIMULATED", "需要 --simulate 启动"),
         },
+        Request::ConfigStatus => {
+            let device = device_view(ctx).await;
+            let guard = ctx.config.lock().await;
+            Response::Config {
+                config: config_proj::config_view(&guard, device),
+            }
+        }
+        Request::ConfigBindAgent { id, name } => bind_agent_rpc(ctx, &id, name.as_deref()).await,
+        Request::ConfigUnbindAgent { id } => unbind_agent_rpc(ctx, &id).await,
+        Request::ConfigSetBalanceInterval { secs } => set_balance_interval(ctx, secs).await,
+        Request::ConfigSetSoundLight { config, preview } => {
+            set_sound_light(ctx, config, preview).await
+        }
+        Request::ConfigSetWorkbuddySession {
+            cookie,
+            chrome_major,
+        } => match config_proj::save_workbuddy_session(
+            &ctx.paths.workbuddy_session,
+            &cookie,
+            chrome_major,
+        ) {
+            Ok(()) => {
+                kick_balance(ctx);
+                Response::Ok
+            }
+            Err(err) => Response::error("IO", err),
+        },
     }
+}
+
+fn linked_apps_error(err: LinkedAppsError) -> Response {
+    let code = err.to_string();
+    Response::error(&code, code.clone())
+}
+
+async fn bind_agent_rpc(ctx: &Ctx, id: &str, name: Option<&str>) -> Response {
+    let path = ctx.paths.linked_apps.clone();
+    let id_owned = id.to_owned();
+    let name_owned = name.map(str::to_owned);
+    let bound = match tokio::task::spawn_blocking(move || {
+        bind_agent(&path, &id_owned, name_owned.as_deref())
+    })
+    .await
+    {
+        Ok(Ok(agent)) => agent,
+        Ok(Err(err)) => return linked_apps_error(err),
+        Err(err) => return Response::error("INTERNAL", err.to_string()),
+    };
+
+    let paths = ctx.paths.clone();
+    let locale = system_locale();
+    let new_id = bound.id.clone();
+    let fetch_agent = bound.clone();
+    let (entry, fetch_err) = match tokio::task::spawn_blocking(move || {
+        config_proj::fetch_one_balance(&fetch_agent, locale)
+    })
+    .await
+    {
+        Ok(v) => v,
+        Err(err) => return Response::error("INTERNAL", err.to_string()),
+    };
+
+    let (agents, read_errors) = {
+        let paths2 = paths.clone();
+        match tokio::task::spawn_blocking(move || config_proj::read_projectable(&paths2)).await {
+            Ok(v) => v,
+            Err(err) => return Response::error("INTERNAL", err.to_string()),
+        }
+    };
+
+    let online = {
+        let guard = ctx.state.lock().await;
+        guard.online
+    };
+    let ts = now_ms();
+    {
+        let mut cfg = ctx.config.lock().await;
+        config_proj::apply_after_bind(
+            &mut cfg,
+            &ctx.device,
+            &paths,
+            agents,
+            &new_id,
+            entry,
+            fetch_err,
+            online,
+            ts,
+            locale,
+        );
+        cfg.errors.extend(read_errors);
+    }
+    publish_bound_indices(ctx).await;
+    let device = device_view(ctx).await;
+    let guard = ctx.config.lock().await;
+    Response::Config {
+        config: config_proj::config_view(&guard, device),
+    }
+}
+
+async fn unbind_agent_rpc(ctx: &Ctx, id: &str) -> Response {
+    let path = ctx.paths.linked_apps.clone();
+    let id_owned = id.to_owned();
+    match tokio::task::spawn_blocking(move || unbind_agent(&path, &id_owned)).await {
+        Ok(Ok(())) => {}
+        Ok(Err(err)) => return linked_apps_error(err),
+        Err(err) => return Response::error("INTERNAL", err.to_string()),
+    }
+
+    let paths = ctx.paths.clone();
+    let (agents, _) = {
+        let paths2 = paths.clone();
+        match tokio::task::spawn_blocking(move || config_proj::read_projectable(&paths2)).await {
+            Ok(v) => v,
+            Err(err) => return Response::error("INTERNAL", err.to_string()),
+        }
+    };
+    let online = {
+        let guard = ctx.state.lock().await;
+        guard.online
+    };
+    let locale = system_locale();
+    let ts = now_ms();
+    {
+        let mut cfg = ctx.config.lock().await;
+        config_proj::apply_after_unbind(
+            &mut cfg,
+            &ctx.device,
+            &paths,
+            agents,
+            id,
+            online,
+            ts,
+            locale,
+        );
+    }
+    publish_bound_indices(ctx).await;
+    let device = device_view(ctx).await;
+    let guard = ctx.config.lock().await;
+    Response::Config {
+        config: config_proj::config_view(&guard, device),
+    }
+}
+
+async fn set_balance_interval(ctx: &Ctx, secs: u64) -> Response {
+    let clamped = BridgeConfig::clamp_secs(secs);
+    let path = ctx.paths.bridge_config.clone();
+    let cfg = BridgeConfig {
+        balance_refresh_secs: clamped,
+    };
+    match tokio::task::spawn_blocking(move || BridgeConfig::save(&path, &cfg)).await {
+        Ok(Ok(())) => {}
+        Ok(Err(err)) => return linked_apps_error(err),
+        Err(err) => return Response::error("INTERNAL", err.to_string()),
+    }
+    ctx.balance_refresh_secs
+        .store(clamped, Ordering::SeqCst);
+    {
+        let mut guard = ctx.config.lock().await;
+        guard.balance_refresh_secs = clamped;
+    }
+    ctx.balance_timer_reset.notify_waiters();
+    let device = device_view(ctx).await;
+    let guard = ctx.config.lock().await;
+    Response::Config {
+        config: config_proj::config_view(&guard, device),
+    }
+}
+
+/// 全量余额刷新（定时 / 上线 / Cookie）；不下发图标。
+fn kick_balance(ctx: &Ctx) {
+    if ctx
+        .proj_busy
+        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+        .is_err()
+    {
+        return;
+    }
+    let ctx = ctx.clone();
+    tokio::spawn(async move {
+        run_balance_projection(&ctx).await;
+        ctx.proj_busy.store(false, Ordering::SeqCst);
+    });
+}
+
+async fn run_balance_projection(ctx: &Ctx) {
+    let online = {
+        let guard = ctx.state.lock().await;
+        guard.online
+    };
+    let paths = ctx.paths.clone();
+    let locale = system_locale();
+    let ts = now_ms();
+
+    let result = tokio::task::spawn_blocking(move || {
+        let (agents, mut errors) = config_proj::read_projectable(&paths);
+        let (cache, fetch_errors) = config_proj::fetch_all_balances(&agents, locale);
+        errors.extend(fetch_errors);
+        (agents, cache, errors)
+    })
+    .await;
+
+    let (agents, cache, errors) = match result {
+        Ok(v) => v,
+        Err(err) => {
+            eprintln!("balance projection join: {err}");
+            return;
+        }
+    };
+
+    {
+        let mut cfg = ctx.config.lock().await;
+        config_proj::apply_balance_only(
+            &mut cfg,
+            &ctx.device,
+            agents,
+            cache,
+            errors,
+            online,
+            ts,
+            locale,
+        );
+    }
+    publish_bound_indices(ctx).await;
+}
+
+async fn set_sound_light(ctx: &Ctx, value: serde_json::Value, preview: bool) -> Response {
+    let mut cfg: SoundLightConfig = match serde_json::from_value(value) {
+        Ok(cfg) => cfg,
+        Err(err) => return Response::error("INVALID_ARGUMENT", err.to_string()),
+    };
+    if let Err(err) = cfg.validate() {
+        return Response::error("INVALID_ARGUMENT", err.to_string());
+    }
+    if preview {
+        cfg = cfg.with_preview(true, true);
+    } else {
+        cfg = cfg.with_preview(false, false);
+    }
+    let payload = match serde_json::to_vec(&cfg) {
+        Ok(bytes) if bytes.len() <= 512 => bytes,
+        Ok(_) => return Response::error("INVALID_ARGUMENT", "sound light payload > 512"),
+        Err(err) => return Response::error("INVALID_ARGUMENT", err.to_string()),
+    };
+    ctx.device.set_sound_light(payload);
+    if !preview {
+        if let Err(err) = ConfigState::save_sound_light(&ctx.paths.sound_light, &cfg) {
+            return Response::error("IO", err);
+        }
+        let mut guard = ctx.config.lock().await;
+        guard.sound_light = cfg;
+    }
+    Response::Ok
 }
 
 async fn approve(ctx: &Ctx, request: ApprovalRequest, timeout_ms: u64) -> Response {
@@ -392,14 +696,28 @@ async fn device_view(ctx: &Ctx) -> DeviceView {
 async fn on_device_event(ctx: &Ctx, event: SessionEvent) {
     match event {
         SessionEvent::ProtocolVersion { .. } => {
-            let mut guard = ctx.state.lock().await;
-            guard.online = true;
+            let became = {
+                let mut guard = ctx.state.lock().await;
+                let was = guard.online;
+                guard.online = true;
+                !was
+            };
+            if became {
+                kick_balance(ctx);
+            }
         }
         SessionEvent::DeviceInfo(info) => {
-            let mut guard = ctx.state.lock().await;
-            guard.online = true;
-            guard.serial = Some(info.serial_number);
-            guard.firmware = Some(info.d_version);
+            let became = {
+                let mut guard = ctx.state.lock().await;
+                let was = guard.online;
+                guard.online = true;
+                guard.serial = Some(info.serial_number);
+                guard.firmware = Some(info.d_version);
+                !was
+            };
+            if became {
+                kick_balance(ctx);
+            }
         }
         SessionEvent::LinkLost(reason) => {
             eprintln!("device lost: {reason}");
@@ -544,6 +862,29 @@ fn sync_projection(state: &mut State) -> Option<(u64, Vec<SlotView>)> {
     }
     state.sent_revision = revision;
     Some((revision, state.approval.projection()))
+}
+
+fn bound_indices_map(agents: &[config_core::ProjectableAgent]) -> HashMap<String, u8> {
+    agents
+        .iter()
+        .map(|a| (a.id.clone(), a.agent_index))
+        .collect()
+}
+
+/// 把配置侧绑定槽同步进审批投影（11.11 `AgentIndex` 只引用，不分配）。
+async fn publish_bound_indices(ctx: &Ctx) {
+    let map = {
+        let cfg = ctx.config.lock().await;
+        bound_indices_map(&cfg.agents)
+    };
+    let sync = {
+        let mut guard = ctx.state.lock().await;
+        guard.approval.set_bound_agent_indices(map);
+        sync_projection(&mut guard)
+    };
+    if let Some((revision, slots)) = sync {
+        ctx.device.sync(revision, slots);
+    }
 }
 
 /// 用系统外壳打开 Agent 的 deeplink。失败只记日志：开不起来不能影响审批。

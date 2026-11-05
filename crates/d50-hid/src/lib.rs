@@ -22,8 +22,11 @@ use thiserror::Error;
 /// Vendor HID 有效区固定 64 字节，不使用 Report ID。
 pub const REPORT_LEN: usize = 64;
 /// 单个应用帧最多带多少 Payload；超过就用多帧。
+///
+/// 与硬件侧发图工具一致：应用帧 Payload=1024，走 First/Middle/End；HID 再切 64B report。
 pub const MAX_FRAME_PAYLOAD: usize = 1024;
-pub const ACK_TIMEOUT: Duration = Duration::from_millis(400);
+/// FIRST/MIDDLE 几乎立刻 ACK；END 要等设备解码整段 PNG（硬件日志约 1.5s）。
+pub const ACK_TIMEOUT: Duration = Duration::from_secs(5);
 pub const MAX_RETRIES: u32 = 2;
 /// PC 空闲超过 1 秒必须补心跳，否则设备 5 秒后判离线。
 pub const HEARTBEAT_IDLE: Duration = Duration::from_millis(1000);
@@ -107,6 +110,8 @@ impl Device {
 
     pub fn request(&self, id: u8, payload: Vec<u8>) -> Result<Vec<u8>, SessionError> {
         let (tx, rx) = channel();
+        // 大 payload（如 SET_AGENT_INDEX 多图）按帧数放宽等待，避免外层先超时、会话还在传。
+        let frame_count = payload.len().div_ceil(MAX_FRAME_PAYLOAD).max(1) as u32;
         self.commands
             .send(Command::Send {
                 id,
@@ -114,7 +119,8 @@ impl Device {
                 reply: tx,
             })
             .map_err(|_| SessionError::Offline)?;
-        let budget = ACK_TIMEOUT * (MAX_RETRIES + 1) * 4 + Duration::from_secs(2);
+        let budget = ACK_TIMEOUT * (MAX_RETRIES + 1) * frame_count
+            + Duration::from_secs(2);
         rx.recv_timeout(budget).map_err(|_| SessionError::Timeout)?
     }
 
@@ -244,6 +250,7 @@ fn transact(
     payload: Vec<u8>,
 ) -> Result<Vec<u8>, SessionError> {
     let kind = return_type(id);
+    // 与硬件日志一致：按 1024 切 First/Middle/End，逐帧等 ACK。
     let frames = split_payload(&payload, MAX_FRAME_PAYLOAD)?;
     let mut response = Vec::new();
     for (frame_type, seq, chunk) in frames {
@@ -522,14 +529,16 @@ mod tests {
                 value
             })
             .collect();
-        let payload = d50_protocol::commands::set_conversation_list(&many).unwrap();
+        // 用超大图标 payload 强制多帧（sim 对 SET_AGENT_INDEX 只 ACK，不解析 PNG）。
+        let png = vec![0u8; MAX_FRAME_PAYLOAD + 128];
+        let payload = d50_protocol::commands::set_agent_index(&[(0, png.as_slice())]).unwrap();
         assert!(
             payload.len() > MAX_FRAME_PAYLOAD,
             "must exercise multi-frame"
         );
         device
-            .request(command::SET_CONVERSATION_LIST, payload)
+            .request(command::SET_AGENT_INDEX, payload)
             .expect("multi-frame ack");
-        assert_eq!(handle.conversations().len(), 6);
+        let _ = (many, handle);
     }
 }

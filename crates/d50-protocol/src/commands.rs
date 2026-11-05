@@ -12,9 +12,11 @@ pub mod command {
     pub const HEARTBEAT: u8 = 0x02;
     pub const TIME_CONFIG: u8 = 0x03;
     pub const SET_PAGE_CONFIG: u8 = 0x10;
+    pub const SET_SOUND_LIGHT_CONFIG: u8 = 0x12;
     pub const SET_AGENT_INDEX: u8 = 0x20;
     pub const SET_CONVERSATION_LIST: u8 = 0x21;
     pub const UPSERT_CONVERSATION: u8 = 0x22;
+    pub const SET_AGENT_BALANCE: u8 = 0x23;
     pub const CONTROL_EVENT: u8 = 0x40;
     pub const CONVERSATION_ACTION: u8 = 0x41;
 }
@@ -234,6 +236,154 @@ pub fn upsert_conversation(conversation: &Conversation) -> Result<Vec<u8>, Proto
     serde_json::to_vec(conversation).map_err(|_| ProtocolError::Parameter)
 }
 
+/// `SET_AGENT_INDEX`：`AgentCount` + 连续 `(AgentIndex, ImageLength LE, PNG)`。
+pub fn set_agent_index(entries: &[(u8, &[u8])]) -> Result<Vec<u8>, ProtocolError> {
+    if entries.len() > 6 {
+        return Err(ProtocolError::Parameter);
+    }
+    let mut seen = [false; 6];
+    let mut out = Vec::new();
+    out.push(entries.len() as u8);
+    for (index, png) in entries {
+        if *index > 5 || seen[usize::from(*index)] {
+            return Err(ProtocolError::Parameter);
+        }
+        if png.is_empty() || png.len() > 65535 {
+            return Err(ProtocolError::Parameter);
+        }
+        seen[usize::from(*index)] = true;
+        out.push(*index);
+        out.extend_from_slice(&(png.len() as u16).to_le_bytes());
+        out.extend_from_slice(png);
+    }
+    Ok(out)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum BalanceType {
+    DoubleBar,
+    SingleBar,
+    Text,
+    Value,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BalanceBar {
+    #[serde(rename = "LeftLabel")]
+    pub left_label: String,
+    #[serde(rename = "RightLabel")]
+    pub right_label: String,
+    #[serde(rename = "Value")]
+    pub value: u8,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentBalance {
+    #[serde(rename = "Name")]
+    pub name: String,
+    #[serde(rename = "AgentIndex")]
+    pub agent_index: u8,
+    #[serde(rename = "Type")]
+    pub balance_type: BalanceType,
+    #[serde(rename = "Bars", skip_serializing_if = "Vec::is_empty", default)]
+    pub bars: Vec<BalanceBar>,
+    #[serde(rename = "Text", skip_serializing_if = "Option::is_none", default)]
+    pub text: Option<String>,
+    #[serde(rename = "Label", skip_serializing_if = "Option::is_none", default)]
+    pub label: Option<String>,
+    #[serde(rename = "ValueText", skip_serializing_if = "Option::is_none", default)]
+    pub value_text: Option<String>,
+}
+
+impl AgentBalance {
+    pub fn validate(&self) -> Result<(), ProtocolError> {
+        if self.name.len() > 32 || self.agent_index > 5 {
+            return Err(ProtocolError::Parameter);
+        }
+        match self.balance_type {
+            BalanceType::DoubleBar => {
+                if self.bars.len() != 2 || self.text.is_some() || self.label.is_some() || self.value_text.is_some()
+                {
+                    return Err(ProtocolError::Parameter);
+                }
+                for bar in &self.bars {
+                    bar.validate()?;
+                }
+            }
+            BalanceType::SingleBar => {
+                if self.bars.len() != 1 || self.text.is_some() || self.label.is_some() || self.value_text.is_some()
+                {
+                    return Err(ProtocolError::Parameter);
+                }
+                self.bars[0].validate()?;
+            }
+            BalanceType::Text => {
+                if !self.bars.is_empty() || self.label.is_some() || self.value_text.is_some() {
+                    return Err(ProtocolError::Parameter);
+                }
+                let text = self.text.as_deref().unwrap_or("");
+                if text.len() > 256 {
+                    return Err(ProtocolError::Parameter);
+                }
+            }
+            BalanceType::Value => {
+                if !self.bars.is_empty() || self.text.is_some() {
+                    return Err(ProtocolError::Parameter);
+                }
+                let label = self.label.as_deref().unwrap_or("");
+                let value = self.value_text.as_deref().unwrap_or("");
+                if label.len() > 32
+                    || label.contains('\n')
+                    || value.is_empty()
+                    || value.len() > 16
+                    || !value.chars().all(|c| c.is_ascii_digit())
+                {
+                    return Err(ProtocolError::Parameter);
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+impl BalanceBar {
+    fn validate(&self) -> Result<(), ProtocolError> {
+        if self.left_label.len() > 32
+            || self.right_label.len() > 32
+            || self.left_label.contains('\n')
+            || self.right_label.contains('\n')
+            || self.value > 100
+        {
+            return Err(ProtocolError::Parameter);
+        }
+        Ok(())
+    }
+}
+
+pub fn set_agent_balance(agents: &[AgentBalance]) -> Result<Vec<u8>, ProtocolError> {
+    if agents.len() > 6 {
+        return Err(ProtocolError::Parameter);
+    }
+    let mut seen = [false; 6];
+    for agent in agents {
+        agent.validate()?;
+        if seen[usize::from(agent.agent_index)] {
+            return Err(ProtocolError::Parameter);
+        }
+        seen[usize::from(agent.agent_index)] = true;
+    }
+    serde_json::to_vec(&serde_json::json!({ "Agents": agents })).map_err(|_| ProtocolError::Parameter)
+}
+
+pub fn set_sound_light_config(json_object: &serde_json::Value) -> Result<Vec<u8>, ProtocolError> {
+    let bytes = serde_json::to_vec(json_object).map_err(|_| ProtocolError::Parameter)?;
+    if bytes.len() > 512 {
+        return Err(ProtocolError::Parameter);
+    }
+    Ok(bytes)
+}
+
 /// 截断到不超过 `max_bytes` 个 UTF-8 字节，并在真的截断时留一个 `…`。
 ///
 /// 设备字段按 UTF-8 字节计数，直接按字节切会把中文切成半个字符，设备上
@@ -390,6 +540,49 @@ mod tests {
     #[test]
     fn clip_handles_exact_boundary() {
         assert_eq!(clip_utf8("abcd", 4), "abcd");
+    }
+
+    #[test]
+    fn set_agent_index_encodes_count_and_pngs() {
+        let png = b"\x89PNG";
+        let payload = set_agent_index(&[(0, png), (1, png)]).unwrap();
+        assert_eq!(payload[0], 2);
+        assert_eq!(payload[1], 0);
+        assert_eq!(&payload[2..4], &4u16.to_le_bytes());
+        assert_eq!(&payload[4..8], png);
+    }
+
+    #[test]
+    fn set_agent_index_zero_clears() {
+        assert_eq!(set_agent_index(&[]).unwrap(), vec![0]);
+    }
+
+    #[test]
+    fn set_agent_balance_json_uses_documented_types() {
+        let agents = vec![AgentBalance {
+            name: "Kimi".into(),
+            agent_index: 0,
+            balance_type: BalanceType::DoubleBar,
+            bars: vec![
+                BalanceBar {
+                    left_label: "5h".into(),
+                    right_label: "80%".into(),
+                    value: 80,
+                },
+                BalanceBar {
+                    left_label: "week".into(),
+                    right_label: "42%".into(),
+                    value: 42,
+                },
+            ],
+            text: None,
+            label: None,
+            value_text: None,
+        }];
+        let json = set_agent_balance(&agents).unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&json).unwrap();
+        assert_eq!(value["Agents"][0]["Type"], "DOUBLE_BAR");
+        assert_eq!(value["Agents"][0]["Bars"].as_array().unwrap().len(), 2);
     }
 
     fn sample() -> Conversation {

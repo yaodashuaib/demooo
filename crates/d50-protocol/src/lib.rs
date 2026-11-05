@@ -9,8 +9,9 @@ pub mod crc;
 pub mod frame;
 
 pub use commands::{
-    Button, ControlEvent, Conversation, ConversationAction, ConversationList, DeviceInfo, HostType,
-    ReturnType, clip_utf8, command, return_type,
+    AgentBalance, BalanceBar, BalanceType, Button, ControlEvent, Conversation, ConversationAction,
+    ConversationList, DeviceInfo, HostType, ReturnType, clip_utf8, command, return_type,
+    set_agent_balance, set_agent_index, set_sound_light_config,
 };
 pub use crc::crc16;
 pub use frame::{

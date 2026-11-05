@@ -4,6 +4,7 @@ members = [
     "crates/d50-protocol",
     "crates/d50-hid",
     "crates/approval-core",
+    "crates/config-core",
     "crates/bridge-ipc",
     "apps/agent-bridge-service",
     "apps/d50-hook",
@@ -32,7 +33,11 @@ tokio = { version = "1", features = [
     "time",
 ] }
 uuid = { version = "1", features = ["serde", "v4"] }
+ureq = { version = "2", default-features = false, features = ["tls", "json"] }
+base64 = "0.22"
+image = { version = "0.25", default-features = false, features = ["png"] }
 d50-protocol = { path = "crates/d50-protocol" }
 d50-hid = { path = "crates/d50-hid" }
 approval-core = { path = "crates/approval-core" }
+config-core = { path = "crates/config-core" }
 bridge-ipc = { path = "crates/bridge-ipc" }

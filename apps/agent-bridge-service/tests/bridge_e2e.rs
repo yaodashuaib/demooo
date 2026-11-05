@@ -6,7 +6,49 @@
 use agent_bridge_service::{Config, start};
 use approval_core::{Decision, Outcome};
 use bridge_ipc::{Request, RequestOption, Response};
+use std::sync::{Mutex, MutexGuard};
 use std::time::Duration;
+
+/// `APPDATA` 进程级；配置类 e2e 改它时互斥，避免并行用例互相踩路径。
+fn lock_appdata() -> MutexGuard<'static, ()> {
+    static LOCK: Mutex<()> = Mutex::new(());
+    LOCK.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+struct TempAppData {
+    dir: std::path::PathBuf,
+    prev: Option<std::ffi::OsString>,
+    _guard: MutexGuard<'static, ()>,
+}
+
+impl TempAppData {
+    fn install() -> Self {
+        let _guard = lock_appdata();
+        let dir = std::env::temp_dir().join(format!("d50-e2e-appdata-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).expect("tmp appdata");
+        let prev = std::env::var_os("APPDATA");
+        unsafe {
+            std::env::set_var("APPDATA", &dir);
+        }
+        Self {
+            dir,
+            prev,
+            _guard,
+        }
+    }
+}
+
+impl Drop for TempAppData {
+    fn drop(&mut self) {
+        unsafe {
+            match &self.prev {
+                Some(v) => std::env::set_var("APPDATA", v),
+                None => std::env::remove_var("APPDATA"),
+            }
+        }
+        let _ = std::fs::remove_dir_all(&self.dir);
+    }
+}
 
 fn unique_pipe(name: &str) -> String {
     format!(r"\\.\pipe\d50-e2e-{}-{}", name, uuid::Uuid::new_v4())
@@ -384,5 +426,208 @@ async fn open_app_button_does_not_decide() {
         )),
         other => panic!("unexpected response {other:?}"),
     }
+    bridge.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn config_status_and_sound_light_round_trip() {
+    // 避免本机 linked-apps / WorkBuddy Cookie 触发外网拖死 IPC。
+    unsafe {
+        std::env::set_var("D50_SKIP_USAGE_NETWORK", "1");
+    }
+    let _appdata = TempAppData::install();
+    let pipe = unique_pipe("config");
+    let bridge = start(Config {
+        pipe: pipe.clone(),
+        simulate: true,
+        serial: None,
+        device_index: 0,
+        report_id_prefix: true,
+    })
+    .expect("bridge starts");
+
+    match send(&pipe, Request::ConfigStatus, 5_000).await {
+        Response::Config { config } => {
+            assert!(config.sound_light.get("Sound").is_some());
+            assert!(config.sound_light.get("Light").is_some());
+        }
+        other => panic!("expected config, got {other:?}"),
+    }
+
+    let cfg = serde_json::json!({
+        "Sound": { "Volume": 40, "AgentPrompt": { "Enabled": true } },
+        "Light": {
+            "Brightness": 50,
+            "AgentPrompt": {
+                "Enabled": true,
+                "Color": { "R": 1, "G": 2, "B": 3 },
+                "DurationMs": 1000
+            }
+        }
+    });
+    assert!(matches!(
+        send(
+            &pipe,
+            Request::ConfigSetSoundLight {
+                config: cfg,
+                preview: true,
+            },
+            5_000,
+        )
+        .await,
+        Response::Ok
+    ));
+
+    assert!(matches!(
+        send(
+            &pipe,
+            Request::ConfigSetWorkbuddySession {
+                cookie: "demo=1".into(),
+                chrome_major: Some(131),
+            },
+            5_000,
+        )
+        .await,
+        Response::Ok
+    ));
+    match send(&pipe, Request::ConfigStatus, 5_000).await {
+        Response::Config { config } => assert!(config.workbuddy_session_configured),
+        other => panic!("expected config, got {other:?}"),
+    }
+    assert!(matches!(
+        send(
+            &pipe,
+            Request::ConfigSetWorkbuddySession {
+                cookie: String::new(),
+                chrome_major: None,
+            },
+            5_000,
+        )
+        .await,
+        Response::Ok
+    ));
+
+    bridge.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn config_bind_unbind_allocates_slots_without_reorder() {
+    unsafe {
+        std::env::set_var("D50_SKIP_USAGE_NETWORK", "1");
+    }
+    let _appdata = TempAppData::install();
+
+    let pipe = unique_pipe("bind");
+    let bridge = start(Config {
+        pipe: pipe.clone(),
+        simulate: true,
+        serial: None,
+        device_index: 0,
+        report_id_prefix: true,
+    })
+    .expect("bridge starts");
+
+    // 等到 simulate 上线（ProtocolVersion / DeviceInfo）。
+    for _ in 0..40 {
+        if let Response::Device { device } = send(&pipe, Request::DeviceStatus, 2_000).await {
+            if device.online {
+                break;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    match send(
+        &pipe,
+        Request::ConfigBindAgent {
+            id: "chatgpt".into(),
+            name: None,
+        },
+        30_000,
+    )
+    .await
+    {
+        Response::Config { config } => {
+            assert_eq!(config.agents.len(), 1);
+            assert_eq!(config.agents[0].id, "chatgpt");
+            assert_eq!(config.agents[0].agent_index, 0);
+        }
+        other => panic!("bind chatgpt: {other:?}"),
+    }
+
+    match send(
+        &pipe,
+        Request::ConfigBindAgent {
+            id: "kimi".into(),
+            name: Some("Kimi".into()),
+        },
+        30_000,
+    )
+    .await
+    {
+        Response::Config { config } => {
+            assert_eq!(config.agents.len(), 2);
+            let chatgpt = config.agents.iter().find(|a| a.id == "chatgpt").unwrap();
+            let kimi = config.agents.iter().find(|a| a.id == "kimi").unwrap();
+            assert_eq!(chatgpt.agent_index, 0);
+            assert_eq!(kimi.agent_index, 1);
+        }
+        other => panic!("bind kimi: {other:?}"),
+    }
+
+    match send(
+        &pipe,
+        Request::ConfigUnbindAgent {
+            id: "chatgpt".into(),
+        },
+        30_000,
+    )
+    .await
+    {
+        Response::Config { config } => {
+            assert_eq!(config.agents.len(), 1);
+            assert_eq!(config.agents[0].id, "kimi");
+            assert_eq!(config.agents[0].agent_index, 1, "unbind must not reorder");
+        }
+        other => panic!("unbind: {other:?}"),
+    }
+
+    match send(
+        &pipe,
+        Request::ConfigBindAgent {
+            id: "workbuddy".into(),
+            name: None,
+        },
+        30_000,
+    )
+    .await
+    {
+        Response::Config { config } => {
+            let wb = config.agents.iter().find(|a| a.id == "workbuddy").unwrap();
+            assert_eq!(wb.agent_index, 0, "reuses lowest free slot");
+        }
+        other => panic!("rebind slot: {other:?}"),
+    }
+
+    match send(
+        &pipe,
+        Request::ConfigSetBalanceInterval { secs: 90 },
+        5_000,
+    )
+    .await
+    {
+        Response::Config { config } => assert_eq!(config.balance_refresh_secs, 90),
+        other => panic!("set interval: {other:?}"),
+    }
+
+    // config_status 只读，不改变列表。
+    match send(&pipe, Request::ConfigStatus, 5_000).await {
+        Response::Config { config } => {
+            assert_eq!(config.agents.len(), 2);
+            assert_eq!(config.balance_refresh_secs, 90);
+        }
+        other => panic!("status: {other:?}"),
+    }
+
     bridge.shutdown().await;
 }

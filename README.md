@@ -24,8 +24,10 @@ Claude Code / Codex
 | `crates/d50-hid` | 一个线程独占设备：心跳、ACK/重传、组帧 | 不认识审批 |
 | `crates/approval-core` | 请求表、6 个会话槽、投影、截止 | 不碰 IO |
 | `crates/bridge-ipc` | 命名管道上的 NDJSON 契约 | 不做业务判断 |
-| `apps/agent-bridge-service` | 组合根 + 设备工作线程 | |
+| `apps/agent-bridge-service` | 组合根 + 设备工作线程 + 配置投影 | |
 | `apps/d50-hook` | 被 Agent 调用，翻译方言 | 不做决策 |
+| `crates/config-core` | Linked App → 图标槽 / 余额卡片 / 声光草稿 | 不碰 HID |
+| `apps/d50-config-client` | Qt 配置上位机（IPC 客户端） | 不打开 HID |
 
 ## 没有设备时跑一遍
 

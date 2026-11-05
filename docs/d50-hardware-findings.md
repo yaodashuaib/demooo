@@ -162,3 +162,11 @@ cargo run --bin d50ctl -- self-test
 注意：实验设备 USB 序列号为 `E8F60AE7A976`，固件 SN `D0D36I024U3670001`，与 2026-10-29 记录的
 `E8F60AE7A97F` 不同一位，原因未查明（换口/换样机/固件 SN 与 USB SN 混记都可能）。
 
+## SET_AGENT_INDEX（2026-11-04，对照硬件发图日志）
+
+- 协议要求 **100×100、每通道 8bit 的 RGB/RGBA PNG**（`icon/` 已按此准备）。
+- 硬件工具：业务 Payload 按 **1024** 切应用帧（First/Middle/End），每帧再拆成 64B HID report；**逐帧等 ACK**。
+- **END 帧 ACK 偏慢**（日志约 1.5s，设备解码整段 PNG），bridge `ACK_TIMEOUT=5s`。
+- 传输中设备可能插播 `SET_SYSTEM_CONFIG` 上报，应派发、不中断当前 0x20 等待。
+- 勿同时开 `D50HidTool` 抢 HID。
+

@@ -7,7 +7,7 @@
 
 use d50_protocol::clip_utf8;
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 
 /// D50 一次最多显示 6 个会话槽；第 7 个必须排队，直接下发会挤掉最老的一条。
 pub const MAX_SHOWN: usize = 6;
@@ -184,6 +184,9 @@ pub struct Approval {
     notices: BTreeMap<String, (u64, Notice)>,
     next_seq: u64,
     revision: u64,
+    /// allowlist id（如 `claude_code`）→ 配置上下文持久化的 `AgentIndex`。
+    /// 由 bridge 在绑定集合变化时写入；审批只引用，不分配。
+    bound_agent_indices: HashMap<String, u8>,
 }
 
 impl Approval {
@@ -194,6 +197,15 @@ impl Approval {
     /// 投影版本；每次可能改变设备内容时递增。
     pub fn revision(&self) -> u64 {
         self.revision
+    }
+
+    /// 用配置侧已绑定槽位替换查找表；内容变化时抬升 revision，使在途会话换图标。
+    pub fn set_bound_agent_indices(&mut self, indices: HashMap<String, u8>) {
+        if self.bound_agent_indices == indices {
+            return;
+        }
+        self.bound_agent_indices = indices;
+        self.revision += 1;
     }
 
     pub fn submit(&mut self, request: ApprovalRequest, now_ms: u64) -> SubmitOutcome {
@@ -443,11 +455,12 @@ impl Approval {
 
     /// 设备显示顺序：提示在最前（它们最需要人动手），其后是审批；各自新会话在前。
     pub fn projection(&self) -> Vec<SlotView> {
+        let bound = &self.bound_agent_indices;
         let mut slots: Vec<(u64, SlotView)> = Vec::new();
         let mut notices: Vec<&(u64, Notice)> = self.notices.values().collect();
         notices.sort_by(|a, b| b.0.cmp(&a.0));
         for (seq, notice) in notices {
-            slots.push((*seq, notice_slot(notice)));
+            slots.push((*seq, notice_slot(notice, bound)));
         }
         let mut shown: Vec<&Entry> = self
             .entries
@@ -456,7 +469,7 @@ impl Approval {
             .collect();
         shown.sort_by(|a, b| b.seq.cmp(&a.seq));
         for entry in shown {
-            slots.push((entry.seq, slot(entry)));
+            slots.push((entry.seq, slot(entry, bound)));
         }
         slots.truncate(MAX_SHOWN);
         slots.into_iter().map(|(_, slot)| slot).collect()
@@ -482,19 +495,25 @@ impl Approval {
     }
 }
 
-/// `agent_id` 到设备图标索引的固定映射；未登记的 Agent 一律用 0。
-pub fn agent_index(agent_id: &str) -> u8 {
+/// hook `agent_id` → allowlist id；与 `config_core::canonicalize_agent_id` 对齐。
+pub fn canonical_agent_id(agent_id: &str) -> Option<&'static str> {
     match agent_id {
-        "claude-code" => 0,
-        "codex" => 1,
-        "workbuddy" => 2,
-        "kimi-cli" => 3,
-        "codebuddy" => 4,
-        _ => 0,
+        "claude_code" | "claude-code" | "claude" => Some("claude_code"),
+        "chatgpt" | "codex" => Some("chatgpt"),
+        "kimi" | "kimi-cli" | "kimi_cli" => Some("kimi"),
+        "workbuddy" => Some("workbuddy"),
+        _ => None,
     }
 }
 
-fn slot(entry: &Entry) -> SlotView {
+/// 从绑定表解析 `AgentIndex`；未绑定回落 0（设备仍显示槽 0 图标，避免非法索引）。
+pub fn agent_index(agent_id: &str, bound: &HashMap<String, u8>) -> u8 {
+    canonical_agent_id(agent_id)
+        .and_then(|id| bound.get(id).copied())
+        .unwrap_or(0)
+}
+
+fn slot(entry: &Entry, bound: &HashMap<String, u8>) -> SlotView {
     let request = &entry.request;
     let mut buttons: Vec<(u8, String)> = request
         .options
@@ -510,14 +529,14 @@ fn slot(entry: &Entry) -> SlotView {
         title: clip_utf8(&format!("{} · {}", request.agent_id, request.tool_name), 64),
         path: clip_utf8(&request.cwd, 64),
         content: clip_utf8(request.summary.lines().next().unwrap_or(""), 64),
-        agent_index: agent_index(&request.agent_id),
+        agent_index: agent_index(&request.agent_id, bound),
         needs_attention: 1,
         buttons,
     }
 }
 
 /// 提示只有一个动作：打开 App。没有 App 可开时退化成「知道了」。
-fn notice_slot(notice: &Notice) -> SlotView {
+fn notice_slot(notice: &Notice, bound: &HashMap<String, u8>) -> SlotView {
     let action = if notice.link.is_empty() {
         // CLI 里没有可拉起的客户端：给个诚实的「知道了」，别写 open app。
         (1, DISMISS_LABEL.to_string())
@@ -529,7 +548,7 @@ fn notice_slot(notice: &Notice) -> SlotView {
         title: clip_utf8(&notice.title, 64),
         path: String::new(),
         content: clip_utf8(&notice.content, 64),
-        agent_index: agent_index(&notice.agent_id),
+        agent_index: agent_index(&notice.agent_id, bound),
         needs_attention: 1,
         buttons: vec![action],
     }
@@ -785,6 +804,25 @@ mod tests {
         let slots = approval.projection();
         assert_eq!(slots[0].buttons.last().unwrap().0, 3);
         assert_eq!(slots[0].buttons.last().unwrap().1, OPEN_APP_LABEL);
+    }
+
+    #[test]
+    fn projection_uses_bound_agent_index_not_hardcoded_slot() {
+        // 与真机一致：chatgpt 占 0，claude_code 占 1；hook 仍传 claude-code。
+        let mut approval = Approval::new();
+        approval.set_bound_agent_indices(HashMap::from([
+            ("chatgpt".into(), 0),
+            ("claude_code".into(), 1),
+        ]));
+        approval.submit(request("r-claude", 10_000), 0);
+        let slots = approval.projection();
+        assert_eq!(slots[0].agent_index, 1);
+        let mut codex = request("r-codex", 10_000);
+        codex.agent_id = "codex".into();
+        approval.submit(codex, 0);
+        let slots = approval.projection();
+        let codex_slot = slots.iter().find(|s| s.id == "r-codex").unwrap();
+        assert_eq!(codex_slot.agent_index, 0);
     }
 
     #[test]
